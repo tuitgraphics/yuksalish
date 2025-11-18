@@ -1,32 +1,77 @@
 import telebot
 import sqlite3
-from telebot.types import Message
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = "8424805856:AAEmua5bh0Cj5YwmJBYMxHAVkrPDTOKUImY"
-CHANNEL_ID = "@Sabohiyya"  # Example: "@my_ref_channel"
+
+# Multiple channels support
+CHANNELS = [
+    "@Sabohiyya",
+    "@qoldan_kegancha"
+]
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# DB
+# Database
 db = sqlite3.connect("data.db", check_same_thread=False)
 cursor = db.cursor()
 
-cursor.execute("""CREATE TABLE IF NOT EXISTS users(
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users(
     user_id INTEGER PRIMARY KEY,
     points INTEGER DEFAULT 0
-)""")
+)
+""")
 
-cursor.execute("""CREATE TABLE IF NOT EXISTS referrals(
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS referrals(
     new_user INTEGER PRIMARY KEY,
     referrer INTEGER,
-    joined INTEGER DEFAULT 0
-)""")  # joined = 0 not joined yet, 1 = joined
+    rewarded INTEGER DEFAULT 0
+)
+""")
+
 db.commit()
 
+
+# ==========================================================
+# Helpers
+# ==========================================================
 
 def add_user(user_id):
     cursor.execute("INSERT OR IGNORE INTO users(user_id, points) VALUES(?, 0)", (user_id,))
     db.commit()
+
+
+def joined_all_channels(user_id):
+    """Check if user joined ALL channels"""
+    for ch in CHANNELS:
+        try:
+            member = bot.get_chat_member(ch, user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except:
+            return False
+    return True
+
+
+def reward_referrer(user_id):
+    """Give point to referrer if new user joined all channels"""
+    cursor.execute("SELECT referrer, rewarded FROM referrals WHERE new_user=?", (user_id,))
+    row = cursor.fetchone()
+
+    if row is None:
+        return
+
+    referrer, rewarded = row
+
+    if rewarded == 1:
+        return
+
+    if joined_all_channels(user_id):
+        cursor.execute("UPDATE referrals SET rewarded = 1 WHERE new_user=?", (user_id,))
+        cursor.execute("UPDATE users SET points = points + 1 WHERE user_id=?", (referrer,))
+        db.commit()
 
 
 def get_points(user_id):
@@ -35,85 +80,107 @@ def get_points(user_id):
     return row[0] if row else 0
 
 
-def check_user_joined(user_id):
-    """Returns True if user joined the channel"""
-    try:
-        member = bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except:
-        return False
+# ==========================================================
+# Buttons
+# ==========================================================
+
+def menu_buttons(user_id):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📥 Проверить подписку", callback_data="check"))
+    kb.add(InlineKeyboardButton("🔗 Моя реферальная ссылка", callback_data="link"))
+    kb.add(InlineKeyboardButton("⭐ Мои баллы", callback_data="stats"))
+    return kb
 
 
-def process_join(user_id):
-    """Check if user joined after referral. If yes → give point."""
-    cursor.execute("SELECT referrer, joined FROM referrals WHERE new_user=?", (user_id,))
-    row = cursor.fetchone()
-
-    if not row:
-        return  # not a referral
-
-    referrer, joined_flag = row
-
-    if joined_flag == 1:
-        return  # already rewarded
-
-    if check_user_joined(user_id):
-        cursor.execute("UPDATE referrals SET joined = 1 WHERE new_user=?", (user_id,))
-        cursor.execute("UPDATE users SET points = points + 1 WHERE user_id=?", (referrer,))
-        db.commit()
+def channels_buttons():
+    kb = InlineKeyboardMarkup()
+    for ch in CHANNELS:
+        kb.add(InlineKeyboardButton(f"➡️ Перейти: {ch}", url=f"https://t.me/{ch[1:]}"))
+    kb.add(InlineKeyboardButton("📥 Проверить подписку", callback_data="check"))
+    return kb
 
 
-@bot.message_handler(commands=['start'])
-def start(message: Message):
+# ==========================================================
+# Start command
+# ==========================================================
+
+@bot.message_handler(commands=["start"])
+def start(message):
     user_id = message.from_user.id
     add_user(user_id)
 
     args = message.text.split()
 
-    # Referral parameter exists
     if len(args) > 1:
         referrer = args[1]
-
-        if referrer != str(user_id):  # can't invite themselves
+        if referrer != str(user_id):  # can't refer self
             cursor.execute("SELECT * FROM referrals WHERE new_user=?", (user_id,))
-            exists = cursor.fetchone()
-
-            if not exists:
+            if cursor.fetchone() is None:
                 cursor.execute("INSERT INTO referrals(new_user, referrer) VALUES(?, ?)",
                                (user_id, referrer))
                 db.commit()
 
-    # Check if user joined channel → maybe give reward
-    process_join(user_id)
-
-    ref_link = f"https://t.me/{bot.get_me().username}?start={user_id}"
+    reward_referrer(user_id)
 
     text = (
-        "👋 Welcome!\n\n"
-        f"Your referral link:\n{ref_link}\n\n"
-        f"⭐ Points: {get_points(user_id)}\n\n"
-        f"To get points, make sure people *join the channel* after your link."
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "Чтобы получать баллы:\n"
+        "1️⃣ Вступай в каналы\n"
+        "2️⃣ Проверь подписку\n"
+        "3️⃣ Получи свою ссылку и приглашай друзей\n"
     )
 
-    bot.send_message(user_id, text)
+    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=menu_buttons(user_id))
 
 
-@bot.message_handler(commands=["stats"])
-def stats(message: Message):
-    user_id = message.from_user.id
-    process_join(user_id)
-    bot.send_message(message.chat.id, f"⭐ Your points: {get_points(user_id)}")
+# ==========================================================
+# Callbacks
+# ==========================================================
 
+@bot.callback_query_handler(func=lambda call: call.data == "check")
+def check_join(call):
+    user_id = call.from_user.id
 
-@bot.message_handler(commands=["check"])
-def check_join(message: Message):
-    user_id = message.from_user.id
-
-    if check_user_joined(user_id):
-        process_join(user_id)
-        bot.send_message(user_id, "✅ You are in the channel!")
+    if joined_all_channels(user_id):
+        reward_referrer(user_id)
+        bot.answer_callback_query(call.id, "🎉 Вы вступили во все каналы!")
+        bot.edit_message_text("🎉 Отлично! Теперь можно приглашать друзей!", 
+                              chat_id=user_id, 
+                              message_id=call.message.message_id,
+                              reply_markup=menu_buttons(user_id))
     else:
-        bot.send_message(user_id, "❌ You are NOT in the channel.\nJoin to get points.")
+        bot.answer_callback_query(call.id, "❌ Вы не вступили во все каналы")
+        bot.edit_message_text("❗ Вступи в каналы, чтобы продолжить:", 
+                              chat_id=user_id,
+                              message_id=call.message.message_id,
+                              reply_markup=channels_buttons())
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "link")
+def give_link(call):
+    user_id = call.from_user.id
+    username = bot.get_me().username
+    link = f"https://t.me/{username}?start={user_id}"
+
+    text = (
+        "🔗 <b>Твоя реферальная ссылка:</b>\n"
+        f"{link}\n\n"
+        "Приглашай друзей и получай баллы!"
+    )
+    bot.edit_message_text(text, chat_id=user_id, message_id=call.message.message_id,
+                          parse_mode="HTML", reply_markup=menu_buttons(user_id))
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "stats")
+def stats(call):
+    user_id = call.from_user.id
+    pts = get_points(user_id)
+
+    bot.edit_message_text(f"⭐ <b>Твои баллы:</b> {pts}",
+                          chat_id=user_id,
+                          message_id=call.message.message_id,
+                          parse_mode="HTML",
+                          reply_markup=menu_buttons(user_id))
 
 
 bot.infinity_polling()
